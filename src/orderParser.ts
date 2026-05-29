@@ -197,7 +197,7 @@ export function parsePastedOrder(text: string, uniqueSkus: string[], uniqueClien
         let vlrTotal = 0;
 
         // Lookahead for a subline (the next line in this layout that has details like "---")
-        let sublinePercentageCells: { val: string; value: number }[] = [];
+        let sublineVpx = 0;
         let hasSubline = false;
         
         if (i + 1 < lines.length) {
@@ -214,13 +214,27 @@ export function parsePastedOrder(text: string, uniqueSkus: string[], uniqueClien
             if (subCells.length < 3 && nextLine.includes(' ')) {
               subCells = nextLine.split(/\s+/);
             }
-            for (let idx = 0; idx < subCells.length; idx++) {
-              const cellVal = subCells[idx].trim();
-              if (cellVal.includes('%')) {
-                sublinePercentageCells.push({
-                  val: cellVal,
-                  value: parsePercentBr(cellVal)
-                });
+            
+            // In the target Portal table copy-pastes, the second row of an item holds VPX at index 3
+            if (subCells.length >= 4) {
+              const targetCell = subCells[3].trim();
+              if (targetCell !== '---' && targetCell !== '-' && targetCell !== '—') {
+                sublineVpx = parsePercentBr(targetCell);
+              }
+            } else {
+              // Fallback: search for first % column in the subline
+              const sublinePercentageCells: { val: string; value: number }[] = [];
+              for (let idx = 0; idx < subCells.length; idx++) {
+                const cellVal = subCells[idx].trim();
+                if (cellVal.includes('%')) {
+                  sublinePercentageCells.push({
+                    val: cellVal,
+                    value: parsePercentBr(cellVal)
+                  });
+                }
+              }
+              if (sublinePercentageCells.length > 0) {
+                sublineVpx = sublinePercentageCells[0].value;
               }
             }
           }
@@ -241,8 +255,8 @@ export function parsePastedOrder(text: string, uniqueSkus: string[], uniqueClien
         }
 
         // Use the corresponding percentage column that is identified as VPX
-        if (hasSubline && sublinePercentageCells.length > 0) {
-          vpx = sublinePercentageCells[0].value;
+        if (hasSubline) {
+          vpx = sublineVpx;
         } else if (hasHeaders && vpxColIdx !== -1 && vpxColIdx < cells.length) {
           vpx = parsePercentBr(cells[vpxColIdx]);
         } else if (percentageCells.length >= 2) {
