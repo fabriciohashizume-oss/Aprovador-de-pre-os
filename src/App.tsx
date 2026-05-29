@@ -36,14 +36,16 @@ import {
   Layers,
   ThumbsUp,
   ThumbsDown,
+  ClipboardList,
   LineChart as LineIcon
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { BaseClienteRow, BaseSkuRow, DecisionRecord, MarginEvaluationResult, MarginStatus } from './types.ts';
 import { SAMPLE_CLIENTE_DATA, SAMPLE_SKU_DATA } from './sampleData.ts';
-import { evaluateMargin, getMarginStatus } from './marginEngine.ts';
+import { evaluateMargin, getMarginStatus, calculateEvaluation, sortRefsDescending } from './marginEngine.ts';
 import { parseExcelFile } from './excelParser.ts';
 import { downloadSampleExcel } from './excelExporter.ts';
+import { parsePastedOrder, ParsedOrderItem } from './orderParser.ts';
 
 // Charts components using Recharts
 import { 
@@ -79,7 +81,7 @@ export default function App() {
   });
 
   // UI States
-  const [activeTab, setActiveTab] = useState<'calculator' | 'database' | 'history'>('calculator');
+  const [activeTab, setActiveTab] = useState<'calculator' | 'database' | 'history' | 'order_analyser'>('calculator');
   const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
   
   // Custom dropdown searchable selectors open states
@@ -105,6 +107,53 @@ export default function App() {
     const saved = localStorage.getItem('approval_decisions_history');
     return saved ? JSON.parse(saved) : [];
   });
+
+  // Copied Order Analyser States
+  const [pastedOrderText, setPastedOrderText] = useState<string>('');
+  const [orderClient, setOrderClient] = useState<string>('');
+  const [orderEstado, setOrderEstado] = useState<string>('SP');
+  const [orderVpcGlobal, setOrderVpcGlobal] = useState<number>(0);
+  const [orderItems, setOrderItems] = useState<ParsedOrderItem[]>([]);
+  const [orderCalculationRef, setOrderCalculationRef] = useState<'ultimo' | 'tresMeses'>('ultimo');
+
+  const handleParsePastedOrderText = (customText?: string) => {
+    const textToParse = customText !== undefined ? customText : pastedOrderText;
+    if (!textToParse.trim()) {
+      triggerToast('Por favor, cole o texto do pedido para analisar.', 'error');
+      return;
+    }
+    const parsed = parsePastedOrder(textToParse, uniqueSkus, uniqueClientes);
+    
+    if (parsed.items.length === 0) {
+      triggerToast('Nenhum item com SKU mapeado foi encontrado no texto colado. Verifique se o SKU ou código do produto está presente.', 'error');
+      return;
+    }
+
+    if (parsed.decodedClient) {
+      setOrderClient(parsed.decodedClient);
+    } else if (uniqueClientes.length > 0) {
+      setOrderClient(uniqueClientes[0]);
+    } else {
+      setOrderClient('VENDA_AVULSA');
+    }
+
+    setOrderVpcGlobal(parsed.vpcGlobal);
+    
+    // Heuristic: identify client region (state) if available in database
+    const matchingClientRow = parsed.decodedClient 
+      ? clienteRows.find(r => r.razaoSocial.toUpperCase() === parsed.decodedClient.toUpperCase())
+      : null;
+    if (matchingClientRow) {
+      setOrderEstado(matchingClientRow.codEstado);
+    } else if (uniqueEstados.length > 0) {
+      setOrderEstado(uniqueEstados[0]);
+    } else {
+      setOrderEstado('SP');
+    }
+
+    setOrderItems(parsed.items);
+    triggerToast(`Sucesso! Separados ${parsed.items.length} itens do pedido para auditoria de margem.`, 'success');
+  };
 
   // Unique lists computed from the current loaded database
   const uniqueClientes = React.useMemo(() => {
@@ -399,6 +448,174 @@ export default function App() {
     return matchS ? matchS.codDescGrupo : 'PRODUTOS QUÍMICOS / GERAL';
   }, [clienteRows, skuRows, selectedSku]);
 
+  // Dynamically compute margem for each item in the parsed pasted list
+  const evaluatedOrderItems = React.useMemo(() => {
+    return orderItems.map((item) => {
+      // 1. Get cost elements (Kardex and Dedutores) using direct client match or state fallback
+      let source: 'CLIENTE' | 'SKU_ESTADO' | 'NENHUM' = 'NENHUM';
+      let sourceDetails = '';
+      let matchingRows: Array<{ rotuloLinha: string; kardexUnit: number; dedutores: number }> = [];
+
+      // Look in Cliente Base
+      let clientMatches = clienteRows.filter(
+        (row) => 
+          row.razaoSocial.toUpperCase() === orderClient.toUpperCase() && 
+          row.codProduto.toUpperCase() === item.sku.toUpperCase()
+      );
+
+      // Filter by state if applicable
+      if (clientMatches.length > 0 && orderEstado) {
+        const stateMatches = clientMatches.filter(
+          (row) => row.codEstado.toUpperCase().trim() === orderEstado.toUpperCase().trim()
+        );
+        if (stateMatches.length > 0) {
+          clientMatches = stateMatches;
+        }
+      }
+
+      if (clientMatches.length > 0) {
+        source = 'CLIENTE';
+        sourceDetails = orderClient;
+        matchingRows = clientMatches.map(row => ({
+          rotuloLinha: row.rotuloLinha,
+          kardexUnit: row.kardexUnit,
+          dedutores: row.dedutores
+        }));
+      } else if (orderEstado && item.sku) {
+        // Fallback to SKU base
+        const skuMatches = skuRows.filter(
+          (row) => 
+            row.codEstado.toUpperCase() === orderEstado.toUpperCase() && 
+            row.codProduto.toUpperCase() === item.sku.toUpperCase()
+        );
+        
+        if (skuMatches.length > 0) {
+          source = 'SKU_ESTADO';
+          sourceDetails = `Estado: ${orderEstado}`;
+          matchingRows = skuMatches.map(row => ({
+            rotuloLinha: row.rotuloLinha,
+            kardexUnit: row.kardexUnit,
+            dedutores: row.dedutores
+          }));
+        }
+      }
+
+      // If no cost mappings are found
+      if (matchingRows.length === 0) {
+        return {
+          sku: item.sku,
+          qtd: item.qtd,
+          precoFinal: item.precoFinal,
+          vpxItem: item.vpx,
+          vlrTotal: item.vlrTotal,
+          source: 'NENHUM' as const,
+          sourceDetails: 'Sem histórico de custo cadastrado',
+          evaluation: null,
+          targetPrice12: null,
+          targetPrice6: null,
+        };
+      }
+
+      // Sort chronological descending
+      const sortedMatches = sortRefsDescending(matchingRows);
+      const latestMatch = sortedMatches[0];
+      
+      // Determine what elements to use based on user calculation choice (ultimo vs tresMeses)
+      let referenceName = '';
+      let kardexUnit = latestMatch.kardexUnit; // Always use latest monthly cost per rule
+      let dedutoresRate = 0;
+
+      if (orderCalculationRef === 'ultimo') {
+        referenceName = `Último Mês (${latestMatch.rotuloLinha})`;
+        dedutoresRate = latestMatch.dedutores;
+      } else {
+        const last3Matches = sortedMatches.slice(0, 3);
+        const listMonths = last3Matches.map(item => item.rotuloLinha).join(', ');
+        referenceName = `Média 3 Meses (${listMonths})`;
+        dedutoresRate = last3Matches.reduce((sum, item) => sum + item.dedutores, 0) / last3Matches.length;
+      }
+
+      const totalVpcVpx = item.vpx + orderVpcGlobal;
+      const evaluation = calculateEvaluation(
+        referenceName,
+        source,
+        sourceDetails,
+        kardexUnit,
+        dedutoresRate,
+        totalVpcVpx,
+        item.precoFinal
+      );
+
+      // Preços Alvo para 12% e 6% de margem
+      const targetPrice12 = (kardexUnit) / (1 - dedutoresRate - (totalVpcVpx / 100) - 0.12);
+      const targetPrice6 = (kardexUnit) / (1 - dedutoresRate - (totalVpcVpx / 100) - 0.06);
+
+      return {
+        sku: item.sku,
+        qtd: item.qtd,
+        precoFinal: item.precoFinal,
+        vpxItem: item.vpx,
+        vlrTotal: item.vlrTotal,
+        source,
+        sourceDetails,
+        evaluation,
+        targetPrice12: targetPrice12 > 0 ? targetPrice12 : null,
+        targetPrice6: targetPrice6 > 0 ? targetPrice6 : null,
+      };
+    });
+  }, [orderItems, orderClient, orderEstado, orderVpcGlobal, orderCalculationRef, clienteRows, skuRows]);
+
+  const handleRecordBatchDecisions = () => {
+    if (evaluatedOrderItems.length === 0) {
+      triggerToast('Nenhum item calculado para salvar no histórico.', 'error');
+      return;
+    }
+
+    const newRecords: DecisionRecord[] = [];
+    let countSaved = 0;
+
+    evaluatedOrderItems.forEach((item) => {
+      if (!item.evaluation) return; // ignore items with no cost mapping
+
+      // Build corresponding Decision record
+      const descGrupo = item.source === 'CLIENTE'
+        ? (clienteRows.find(c => c.codProduto === item.sku)?.codDescGrupo || 'GERAL')
+        : (skuRows.find(s => s.codProduto === item.sku)?.codDescGrupo || 'GERAL');
+
+      const isAproved = item.evaluation.status === 'TARGET' || item.evaluation.status === 'REGULAR';
+      
+      newRecords.push({
+        id: 'DEC-LOT-' + Date.now() + '-' + Math.floor(Math.random() * 10000),
+        timestamp: new Date().toLocaleString('pt-BR'),
+        razaoSocial: orderClient,
+        codEstado: orderEstado,
+        codProduto: item.sku,
+        descGrupo,
+        precoNF: item.precoFinal,
+        vpcVpx: item.vpxItem + orderVpcGlobal,
+        marginRefUsed: orderCalculationRef,
+        kardex: item.evaluation.kardex,
+        dedutores: item.evaluation.dedutores,
+        mgcRs: item.evaluation.mgcRs,
+        mgcPercentage: item.evaluation.mgcPercentage,
+        status: item.evaluation.status,
+        decision: isAproved ? 'APROVADO' : 'HELD_FOR_REVIEW',
+        comment: `Auditoria de lote de pedido completo. Qtd: ${item.qtd} unidades.`
+      });
+      countSaved++;
+    });
+
+    if (newRecords.length === 0) {
+      triggerToast('Nenhum item válido com margem pôde ser registrado no lote.', 'error');
+      return;
+    }
+
+    const updated = [...newRecords, ...decisions];
+    setDecisions(updated);
+    localStorage.setItem('approval_decisions_history', JSON.stringify(updated));
+    triggerToast(`${countSaved} itens do pedido salvos no histórico de decisões auditadas!`, 'success');
+  };
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 font-sans flex flex-col antialiased">
       
@@ -523,6 +740,20 @@ export default function App() {
             >
               <Calculator className="h-4 w-4" />
               Simulador & Aprovador
+            </button>
+            <button
+              onClick={() => setActiveTab('order_analyser')}
+              className={`py-4 px-1 border-b-2 font-semibold text-sm flex items-center gap-2 transition-all ${
+                activeTab === 'order_analyser'
+                  ? 'border-emerald-600 text-emerald-700'
+                  : 'border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300'
+              }`}
+            >
+              <ClipboardList className="h-4 w-4" />
+              Auditoria de Pedido Copiado
+              <span className="bg-emerald-500/10 text-emerald-700 text-[10px] font-extrabold px-1.5 py-0.5 rounded-full uppercase tracking-wider">
+                Novo
+              </span>
             </button>
             <button
               onClick={() => setActiveTab('database')}
@@ -1318,6 +1549,476 @@ export default function App() {
                 })}
               </div>
             )}
+
+          </div>
+        )}
+
+        {/* TAB 4: ORDER ANALYSER */}
+        {activeTab === 'order_analyser' && (
+          <div className="space-y-6">
+            
+            {/* Intro Header Card */}
+            <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-md">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div className="flex items-start gap-3">
+                  <div className="bg-emerald-100 p-2.5 rounded-xl text-emerald-700 shrink-0 mt-1">
+                    <ClipboardList className="h-6 w-6" />
+                  </div>
+                  <div>
+                    <h2 className="font-bold text-lg text-slate-800 font-sans">Cópia & Auditoria Rápida de Pedidos</h2>
+                    <p className="text-sm text-slate-500 mt-1">
+                      Cole a tela inteira do portal do pedido (incluindo o cabeçalho e a tabela de produtos). O motor identificará o cliente, o VPC de contrato global e calculará a margem de contribuição (MCE) individual de cada item automaticamente.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold text-slate-400 bg-slate-100 px-3 py-1.5 rounded-lg border border-slate-200">
+                    Pressione Ctrl+A no portal, copie e cole ao lado
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
+              
+              {/* Left Column: Paste Input & Global parameters override (Col span 4) */}
+              <div className="xl:col-span-4 bg-white p-5 rounded-2xl border border-slate-200/80 shadow-md flex flex-col gap-4">
+                <div className="border-b border-slate-100 pb-3 flex items-center justify-between">
+                  <h3 className="font-bold text-sm text-slate-800 uppercase tracking-wide flex items-center gap-2">
+                    <Upload className="h-4 w-4 text-emerald-600" />
+                    Área de Transferência
+                  </h3>
+                  <button 
+                    type="button"
+                    onClick={() => {
+                      setPastedOrderText('');
+                      setOrderItems([]);
+                    }}
+                    className="text-xs text-rose-600 hover:text-rose-800 font-bold transition-all cursor-pointer"
+                  >
+                    Limpar
+                  </button>
+                </div>
+
+                {/* Paste Area */}
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-xs font-semibold text-slate-500">Cole a tela do pedido aqui (Ctrl+V):</label>
+                  <textarea
+                    rows={8}
+                    value={pastedOrderText}
+                    onChange={(e) => setPastedOrderText(e.target.value)}
+                    placeholder="Nome Fantasia: 007140318 - ...&#10;VPC Contratual: 4.5%&#10;&#10;Família  Código  Tarja  Desc.  Qtd.  Vlr. Total  Preço Final&#10;HC  HC028  •  -0.15%  12  R$ 237,36  R$ 19,78..."
+                    className="w-full text-xs font-mono p-3 rounded-xl border border-slate-200 bg-slate-50/50 focus:outline-none focus:ring-2 focus:ring-emerald-500 leading-relaxed resize-y"
+                  />
+                </div>
+
+                <div className="flex gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => handleParsePastedOrderText()}
+                    className="flex-1 bg-emerald-600 hover:bg-emerald-500 active:scale-[0.98] transition-all text-white text-xs font-bold py-2.5 px-4 rounded-xl shadow-md shadow-emerald-500/10 flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <Check className="h-4 w-4" />
+                    Processar & Mapear Itens
+                  </button>
+                </div>
+
+                {/* Overrides and custom tweaks parameters */}
+                <div className="border-t border-slate-100 pt-4 mt-2 flex flex-col gap-3">
+                  <div className="flex items-center gap-1.5 border-b border-slate-50 pb-2">
+                    <span className="text-[10px] bg-indigo-50 text-indigo-700 font-bold px-1.5 py-0.5 rounded uppercase font-mono">Parametrização</span>
+                    <h4 className="text-xs font-bold text-slate-705 font-sans">Ajustes Finos Globais</h4>
+                  </div>
+
+                  {/* Override Client */}
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[11px] font-semibold text-slate-500 flex items-center gap-1">
+                      <User className="h-3.5 w-3.5 text-slate-400" />
+                      Cliente Associado:
+                    </label>
+                    <select
+                      value={orderClient}
+                      onChange={(e) => setOrderClient(e.target.value)}
+                      className="text-xs py-1.5 px-2 bg-white rounded-lg border border-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 font-medium text-slate-750"
+                    >
+                      <option value="VENDA_AVULSA">Venda Avulsa (Sem Histórico Cliente)</option>
+                      {uniqueClientes.map(c => (
+                        <option key={c} value={c}>{c}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Override Estado */}
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[11px] font-semibold text-slate-500 flex items-center gap-1">
+                      <MapPin className="h-3.5 w-3.5 text-slate-400" />
+                      Estado (Região Fiscal):
+                    </label>
+                    <select
+                      value={orderEstado}
+                      onChange={(e) => setOrderEstado(e.target.value)}
+                      className="text-xs py-1.5 px-2 bg-white rounded-lg border border-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 font-medium text-slate-750"
+                    >
+                      {uniqueEstados.map(uf => (
+                        <option key={uf} value={uf}>{uf.toUpperCase()}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Override VPC Contratual */}
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[11px] font-semibold text-slate-500 flex items-center gap-1">
+                      <Percent className="h-3.5 w-3.5 text-slate-400" />
+                      Soma VPC Contratual do Pedido (%):
+                    </label>
+                    <input
+                      type="number"
+                      step="0.05"
+                      min="0"
+                      max="100"
+                      value={orderVpcGlobal}
+                      onChange={(e) => setOrderVpcGlobal(parseFloat(e.target.value) || 0)}
+                      className="text-xs p-1.5 bg-white rounded-lg border border-slate-205 focus:outline-none focus:ring-2 focus:ring-emerald-500 font-mono font-bold"
+                    />
+                    <span className="text-[10px] text-slate-400 leading-normal">
+                      Esta verba soma-se com a coluna <b>VPX de cada item</b> para compor a verba comercial inteira.
+                    </span>
+                  </div>
+
+                  {/* Pricing Reference Type Selection */}
+                  <div className="flex flex-col gap-1.5 mt-2">
+                    <label className="text-[11px] font-semibold text-slate-500">Mapeamento de Demonstrador / DRE:</label>
+                    <div className="grid grid-cols-2 gap-2 bg-slate-50 p-1.5 rounded-lg border border-slate-200/50">
+                      <button
+                        type="button"
+                        onClick={() => setOrderCalculationRef('ultimo')}
+                        className={`text-[10px] font-bold py-1.5 rounded-md text-center transition-all ${
+                          orderCalculationRef === 'ultimo'
+                            ? 'bg-white text-emerald-800 shadow-sm'
+                            : 'text-slate-500 hover:text-slate-800'
+                        }`}
+                      >
+                        Último Mês
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setOrderCalculationRef('tresMeses')}
+                        className={`text-[10px] font-bold py-1.5 rounded-md text-center transition-all ${
+                          orderCalculationRef === 'tresMeses'
+                            ? 'bg-white text-emerald-800 shadow-sm'
+                            : 'text-slate-500 hover:text-slate-800'
+                        }`}
+                      >
+                        Média 3 Meses
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Right Column: Calculations results Dashboard & Table (Col span 8) */}
+              <div className="xl:col-span-8 flex flex-col gap-6">
+                
+                {orderItems.length === 0 ? (
+                  /* Empty state display */
+                  <div className="bg-white p-12 rounded-2xl border border-slate-200/80 shadow-md text-center flex flex-col items-center justify-center min-h-[400px]">
+                    <div className="bg-indigo-50 p-4 rounded-full text-indigo-500 mb-4 animate-pulse">
+                      <ClipboardList className="h-10 w-10" />
+                    </div>
+                    <h3 className="text-base font-bold text-slate-700">Aguardando Pedido</h3>
+                    <p className="text-xs text-slate-500 max-w-sm mt-1.5 leading-relaxed">
+                      Selecione tudo no portal com <b>Ctrl+A</b>, copie (<b>Ctrl+C</b>) e cole no painel ao lado para auditar instantaneamente todas as margens e preços ideais.
+                    </p>
+                    <div className="mt-6 flex flex-wrap gap-2 justify-center text-[10px] font-semibold text-slate-400">
+                      <span className="bg-slate-50 border border-slate-100 rounded-lg px-2.5 py-1">✓ Varre Nome do Cliente</span>
+                      <span className="bg-slate-50 border border-slate-100 rounded-lg px-2.5 py-1">✓ Extrai Verba Contratual</span>
+                      <span className="bg-slate-50 border border-slate-100 rounded-lg px-2.5 py-1">✓ Cruzamento com DRE de Venda</span>
+                    </div>
+                  </div>
+                ) : (
+                  /* Valid results displays */
+                  <div className="space-y-6">
+                    
+                    {/* General Statistics Cards */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                      {/* Total Revenue */}
+                      <div className="bg-white p-4 rounded-xl border border-slate-205 shadow-sm flex flex-col gap-1">
+                        <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Faturamento Total</span>
+                        <span className="text-lg font-black text-slate-800 font-mono">
+                          R$ {evaluatedOrderItems.reduce((acc, i) => acc + (i.precoFinal * i.qtd), 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </span>
+                        <span className="text-[10px] text-slate-400 mt-0.5">
+                          {evaluatedOrderItems.reduce((acc, i) => acc + i.qtd, 0)} unidades do pedido
+                        </span>
+                      </div>
+
+                      {/* Total MCE Margin */}
+                      {(() => {
+                        const totalSales = evaluatedOrderItems.reduce((acc, i) => acc + (i.precoFinal * i.qtd), 0);
+                        const totalMce = evaluatedOrderItems.reduce((acc, i) => {
+                          if (i.evaluation) {
+                            return acc + (i.evaluation.mgcRs * i.qtd);
+                          }
+                          return acc;
+                        }, 0);
+                        const mcePercentGlobal = totalSales > 0 ? (totalMce / totalSales) * 100 : 0;
+                        const globalStatus = mcePercentGlobal >= 12 ? 'bg-emerald-500 text-white shadow-inner shadow-emerald-400/20' : mcePercentGlobal >= 6 ? 'bg-amber-500 text-slate-900' : 'bg-rose-600 text-white';
+
+                        return (
+                          <div className="bg-white p-4 rounded-xl border border-slate-205 shadow-sm flex flex-col gap-1">
+                            <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Margem Global MCE</span>
+                            <span className="text-lg font-black text-slate-800 font-mono">
+                              R$ {totalMce.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            </span>
+                            <div className="flex items-center gap-1.5 mt-0.5">
+                              <span className="text-xs font-black font-mono">{mcePercentGlobal.toFixed(2)}%</span>
+                              <span className={`text-[8.5px] font-extrabold px-1.5 py-0.2 rounded uppercase ${globalStatus}`}>
+                                {mcePercentGlobal >= 12 ? 'TARGET (OTIMA)' : mcePercentGlobal >= 6 ? 'REGULAR' : 'ALTO RISCO'}
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Total Costs Estimations */}
+                      <div className="bg-white p-4 rounded-xl border border-slate-205 shadow-sm flex flex-col gap-1">
+                        <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Verba Deduzida</span>
+                        <span className="text-lg font-black text-rose-600 font-mono">
+                          - R$ {evaluatedOrderItems.reduce((acc, i) => acc + (i.precoFinal * ((i.vpxItem + orderVpcGlobal) / 100) * i.qtd), 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </span>
+                        <span className="text-[10px] text-slate-405 font-semibold uppercase font-mono">
+                          Média: {(((evaluatedOrderItems.reduce((acc, i) => acc + ((i.vpxItem + orderVpcGlobal) * i.qtd), 0)) / (evaluatedOrderItems.reduce((acc, i) => acc + i.qtd, 0)) || 0).toFixed(2))}% vpc + vpx
+                        </span>
+                      </div>
+
+                      {/* Status classifications summary */}
+                      <div className="bg-white p-4 rounded-xl border border-slate-205 shadow-sm flex flex-col justify-between">
+                        <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Classificação Margem</span>
+                        <div className="flex flex-wrap gap-1 mt-1.5">
+                          {(() => {
+                            const stats = { TARGET: 0, REGULAR: 0, RUIM: 0, NEGATIVA: 0, NONE: 0 };
+                            evaluatedOrderItems.forEach(i => {
+                              if (i.evaluation) {
+                                stats[i.evaluation.status]++;
+                              } else {
+                                stats.NONE++;
+                              }
+                            });
+                            return (
+                              <>
+                                {stats.TARGET > 0 && <span className="text-[9px] font-black px-1.5 bg-emerald-100 text-emerald-800 rounded">{stats.TARGET} Tgt</span>}
+                                {stats.REGULAR > 0 && <span className="text-[9px] font-black px-1.5 bg-amber-100 text-amber-800 rounded">{stats.REGULAR} Reg</span>}
+                                {stats.RUIM > 0 && <span className="text-[9px] font-black px-1.5 bg-orange-100 text-orange-850 rounded">{stats.RUIM} Rvs</span>}
+                                {stats.NEGATIVA > 0 && <span className="text-[9px] font-black px-1.5 bg-rose-100 text-rose-800 rounded">{stats.NEGATIVA} Neg</span>}
+                                {stats.NONE > 0 && <span className="text-[9px] font-black px-1.5 bg-slate-100 text-slate-600 rounded">{stats.NONE} Novo</span>}
+                              </>
+                            );
+                          })()}
+                        </div>
+                        <span className="text-[9px] text-slate-350 font-semibold mt-1">Auditado sob {orderCalculationRef === 'ultimo' ? 'último mês' : 'média de 3 meses'}</span>
+                      </div>
+                    </div>
+
+                    {/* Quick Warning if there are negative or bad margin items */}
+                    {evaluatedOrderItems.some(i => i.evaluation && (i.evaluation.status === 'NEGATIVA' || i.evaluation.status === 'RUIM')) && (
+                      <div className="bg-orange-50 border border-orange-200 p-4 rounded-xl flex items-start gap-2.5">
+                        <AlertTriangle className="h-5 w-5 text-orange-500 shrink-0 mt-0.5 animate-bounce" />
+                        <div>
+                          <h4 className="text-xs font-bold text-orange-850 uppercase">Itens fora da meta identificados</h4>
+                          <p className="text-[11px] text-orange-700 mt-0.5 leading-relaxed">
+                            Há produtos que resultaram em margens ruins ou negativas na simulação sob a base de custos ativa. Avalie aumentar o preço de venda para os valores sugeridos de Preço Alvo na tabela ou reduza as verbas negociadas.
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Batch Actions Toolbar */}
+                    <div className="bg-slate-900 text-white p-4 rounded-2xl flex flex-col sm:flex-row items-center justify-between gap-3 shadow-md">
+                      <div>
+                        <h4 className="text-xs font-bold font-sans uppercase text-slate-205">Exportação de Simulações em Lote</h4>
+                        <p className="text-[10px] text-slate-400 mt-0.5">Com um clique, registre todos os itens calculados na base histórica.</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleRecordBatchDecisions}
+                        className="w-full sm:w-auto bg-emerald-500 hover:bg-emerald-400 font-bold text-slate-950 text-xs py-2 px-4 rounded-lg shadow-sm transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                      >
+                        <Sparkles className="h-3.5 w-3.5" />
+                        Salvar Itens no Histórico de Decisões
+                      </button>
+                    </div>
+
+                    {/* Active Order Items List and audit metrics */}
+                    <div className="bg-white rounded-2xl border border-slate-205 shadow-md overflow-hidden">
+                      <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+                        <div>
+                          <h3 className="font-bold text-slate-800 text-sm uppercase tracking-wide">Itens do Pedido Carregados</h3>
+                          <p className="text-[10px] text-slate-400">Varredura e comparação com o Cadastro de Custos de Clientes e fallback por Estado</p>
+                        </div>
+                        <span className="text-[10px] text-indigo-650 font-extrabold bg-indigo-50 px-2.5 py-0.5 rounded-full">
+                          Cliente: {orderClient}
+                        </span>
+                      </div>
+
+                      <div className="overflow-x-auto font-sans">
+                        <table className="w-full min-w-[800px] text-left border-collapse">
+                          <thead>
+                            <tr className="bg-slate-50 border-b border-slate-100 text-slate-500 uppercase font-black text-[10px] tracking-wider">
+                              <th className="py-3.5 px-4 text-center w-12">Status</th>
+                              <th className="py-3.5 px-3">Código SKU</th>
+                              <th className="py-3.5 px-2 text-center">Qtd</th>
+                              <th className="py-3.5 px-3 text-right">Preço Final</th>
+                              <th className="py-3.5 px-3 text-center">VPX + VPC</th>
+                              <th className="py-3.5 px-3 text-center">Custo Base (Kardex)</th>
+                              <th className="py-3.5 px-3 text-right">MCE Unitário</th>
+                              <th className="py-3.5 px-3 text-right">MCE Total</th>
+                              <th className="py-3.5 px-4 text-right">Preço Ideal (6% / 12%)</th>
+                              <th className="py-3.5 px-3 text-center">Ações</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 text-xs font-semibold">
+                            {evaluatedOrderItems.map((item, index) => {
+                              const hasEval = !!item.evaluation;
+                              
+                              const statusIndicator = hasEval 
+                                ? {
+                                    TARGET: { bar: 'bg-emerald-500', text: 'TARGET', class: 'bg-emerald-50 text-emerald-850' },
+                                    REGULAR: { bar: 'bg-amber-500', text: 'REGULAR', class: 'bg-amber-50 text-amber-850 font-bold' },
+                                    RUIM: { bar: 'bg-orange-550', text: 'REVISAR', class: 'bg-orange-50 text-orange-800 font-bold animate-pulse' },
+                                    NEGATIVA: { bar: 'bg-rose-500', text: 'NEGATIVA', class: 'bg-rose-50 text-rose-800 border border-rose-200 font-bold' }
+                                  }[item.evaluation!.status]
+                                : { bar: 'bg-slate-300', text: 'S/ CUSTO', class: 'bg-slate-100 text-slate-600 font-bold' };
+
+                              return (
+                                <tr key={item.sku + '-' + index} className="hover:bg-slate-50/50 transition-colors">
+                                  {/* Status indicator bar in margin */}
+                                  <td className="py-3 px-4 text-center">
+                                    <div className="flex items-center justify-center gap-1.5">
+                                      <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${statusIndicator.bar}`} />
+                                      <span className={`text-[9px] font-black tracking-wide px-1.5 py-0.2 rounded uppercase font-mono ${statusIndicator.class}`}>
+                                        {statusIndicator.text}
+                                      </span>
+                                    </div>
+                                  </td>
+
+                                  {/* SKU Product code and mapping source */}
+                                  <td className="py-3 px-3">
+                                    <div className="flex flex-col">
+                                      <span className="font-bold text-slate-800 font-mono">{item.sku}</span>
+                                      <span className="text-[9px] text-slate-400 font-black uppercase mt-0.5 truncate max-w-[120px]">
+                                        {item.source === 'CLIENTE' ? 'Base Cliente' : item.source === 'SKU_ESTADO' ? `Fallback ${orderEstado}` : 'Manual/Sem Custo'}
+                                      </span>
+                                    </div>
+                                  </td>
+
+                                  {/* Quantity */}
+                                  <td className="py-3 px-2 text-center font-extrabold text-slate-705">
+                                    {item.qtd}
+                                  </td>
+
+                                  {/* Price Final parsed */}
+                                  <td className="py-3 px-3 text-right text-slate-800 font-mono font-black text-xs">
+                                    R$ {item.precoFinal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                                  </td>
+
+                                  {/* VPX + VPC breakdown */}
+                                  <td className="py-3 px-3 text-center">
+                                    <div className="flex flex-col items-center">
+                                      <span className="font-mono text-[11px] font-extrabold text-slate-705">
+                                        {(item.vpxItem + orderVpcGlobal).toFixed(2)}%
+                                      </span>
+                                      <span className="text-[9px] text-slate-400 leading-none mt-0.5">
+                                        {item.vpxItem}% vpx + {orderVpcGlobal}% vpc
+                                      </span>
+                                    </div>
+                                  </td>
+
+                                  {/* Custo Base (Kardex) & Dedutores */}
+                                  <td className="py-3 px-3 text-center">
+                                    {hasEval ? (
+                                      <div className="flex flex-col items-center">
+                                        <span className="font-mono font-extrabold text-slate-800">
+                                          R$ {item.evaluation!.kardex.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                                        </span>
+                                        <span className="text-[9px] text-slate-400 mt-0.5">
+                                          Ded: {(item.evaluation!.dedutores * 100).toFixed(2)}%
+                                        </span>
+                                      </div>
+                                    ) : (
+                                      <span className="text-[10px] text-slate-400 font-semibold italic">Não mapeado</span>
+                                    )}
+                                  </td>
+
+                                  {/* Individual MCE Margin */}
+                                  <td className="py-3 px-3 text-right font-mono">
+                                    {hasEval ? (
+                                      <div className="flex flex-col items-end">
+                                        <span className={`font-black text-xs ${item.evaluation!.status === 'NEGATIVA' ? 'text-rose-600' : item.evaluation!.status === 'RUIM' ? 'text-orange-600' : item.evaluation!.status === 'REGULAR' ? 'text-amber-600' : 'text-emerald-600'}`}>
+                                          {(item.evaluation!.mgcPercentage * 100).toFixed(2)}%
+                                        </span>
+                                        <span className="text-[9px] text-slate-400 mt-0.5 leading-none">
+                                          R$ {item.evaluation!.mgcRs.toLocaleString('pt-BR', { minimumFractionDigits: 2 })} unit.
+                                        </span>
+                                      </div>
+                                    ) : (
+                                      <span className="text-[10px] text-slate-400 font-semibold italic">-</span>
+                                    )}
+                                  </td>
+
+                                  {/* Row Total Margin */}
+                                  <td className="py-3 px-3 text-right font-mono font-bold text-slate-800">
+                                    {hasEval ? (
+                                      <span>
+                                        R$ {(item.evaluation!.mgcRs * item.qtd).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                                      </span>
+                                    ) : (
+                                      <span className="text-[10px] text-slate-400 font-semibold italic">-</span>
+                                    )}
+                                  </td>
+
+                                  {/* Suggested target prices */}
+                                  <td className="py-3 px-4 text-right">
+                                    {hasEval ? (
+                                      <div className="flex flex-col items-end">
+                                        <span className="text-[10.5px] font-mono text-emerald-600 font-black">
+                                          R$ {item.targetPrice12 && item.targetPrice12 > 0 ? item.targetPrice12.toLocaleString('pt-BR', { minimumFractionDigits: 2 }) : 'N/A'} (12%)
+                                        </span>
+                                        <span className="text-[9px] font-mono text-slate-400 font-extrabold mt-0.5">
+                                          R$ {item.targetPrice6 && item.targetPrice6 > 0 ? item.targetPrice6.toLocaleString('pt-BR', { minimumFractionDigits: 2 }) : 'N/A'} (6%)
+                                        </span>
+                                      </div>
+                                    ) : (
+                                      <span className="text-[10px] text-slate-400 font-semibold italic">Configure custos</span>
+                                    )}
+                                  </td>
+
+                                  {/* Delete row handler */}
+                                  <td className="py-3 px-3 text-center">
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const updated = orderItems.filter((_, i) => i !== index);
+                                        setOrderItems(updated);
+                                        triggerToast('Produto removido da simulação em lote.', 'info');
+                                      }}
+                                      className="p-1 px-1.5 bg-slate-100 hover:bg-rose-50 text-slate-400 hover:text-rose-600 border border-slate-200 hover:border-rose-200 rounded transition-all cursor-pointer"
+                                      title="Remover Item"
+                                    >
+                                      <Trash2 className="h-3.5 w-3.5" />
+                                    </button>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+              </div>
+            </div>
 
           </div>
         )}
