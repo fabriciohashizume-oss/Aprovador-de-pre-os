@@ -115,6 +115,8 @@ export default function App() {
   const [orderVpcGlobal, setOrderVpcGlobal] = useState<number>(0);
   const [orderItems, setOrderItems] = useState<ParsedOrderItem[]>([]);
   const [orderCalculationRef, setOrderCalculationRef] = useState<'ultimo' | 'tresMeses'>('ultimo');
+  const [orderKardexOverrides, setOrderKardexOverrides] = useState<Record<number, number>>({});
+  const [customKardex, setCustomKardex] = useState<string>('');
 
   const handleParsePastedOrderText = (customText?: string) => {
     const textToParse = customText !== undefined ? customText : pastedOrderText;
@@ -128,6 +130,8 @@ export default function App() {
       triggerToast('Nenhum item com SKU mapeado foi encontrado no texto colado. Verifique se o SKU ou código do produto está presente.', 'error');
       return;
     }
+
+    setOrderKardexOverrides({});
 
     if (parsed.decodedClient) {
       setOrderClient(parsed.decodedClient);
@@ -282,9 +286,43 @@ export default function App() {
 
   // Math simulation numeric variables
   const parsedPrecoNF = parseFloat(precoNF.replace(',', '.')) || 0;
+
+  // Find natural database Kardex before override so we can show it as reference
+  const currentDatabaseKardex = React.useMemo(() => {
+    const isClientSource = selectedCliente !== 'VENDA_AVULSA';
+    let matches: Array<{ rotuloLinha: string; kardexUnit: number; dedutores: number }> = [];
+    if (isClientSource) {
+      let clientMatches = clienteRows.filter(
+        (row) => 
+          row.razaoSocial.toUpperCase() === selectedCliente.toUpperCase() && 
+          row.codProduto.toUpperCase() === selectedSku.toUpperCase()
+      );
+      if (clientMatches.length > 0 && selectedEstado) {
+        const stateMatches = clientMatches.filter(
+          (row) => row.codEstado.toUpperCase().trim() === selectedEstado.toUpperCase().trim()
+        );
+        if (stateMatches.length > 0) {
+          clientMatches = stateMatches;
+        }
+      }
+      matches = clientMatches;
+    } else if (selectedEstado && selectedSku) {
+      matches = skuRows.filter(
+        (row) => 
+          row.codEstado.toUpperCase() === selectedEstado.toUpperCase() && 
+          row.codProduto.toUpperCase() === selectedSku.toUpperCase()
+      );
+    }
+    if (matches.length > 0) {
+      const sorted = sortRefsDescending(matches);
+      return sorted[0].kardexUnit;
+    }
+    return 0;
+  }, [clienteRows, skuRows, selectedCliente, selectedSku, selectedEstado]);
   
   // Calculate simulation
   const simulation = React.useMemo(() => {
+    const overrideKardexAmt = customKardex !== '' ? (parseFloat(customKardex.replace(',', '.')) || 0) : undefined;
     return evaluateMargin(
       clienteRows,
       skuRows,
@@ -292,9 +330,10 @@ export default function App() {
       selectedSku,
       selectedEstado,
       parsedPrecoNF,
-      vpcVpxPercent
+      vpcVpxPercent,
+      overrideKardexAmt
     );
-  }, [clienteRows, skuRows, selectedCliente, selectedSku, selectedEstado, parsedPrecoNF, vpcVpxPercent]);
+  }, [clienteRows, skuRows, selectedCliente, selectedSku, selectedEstado, parsedPrecoNF, vpcVpxPercent, customKardex]);
 
   // Handle decisions logging
   const recordDecision = (type: 'APROVADO' | 'REJEITADO' | 'HELD_FOR_REVIEW') => {
@@ -450,7 +489,7 @@ export default function App() {
 
   // Dynamically compute margem for each item in the parsed pasted list
   const evaluatedOrderItems = React.useMemo(() => {
-    return orderItems.map((item) => {
+    return orderItems.map((item, index) => {
       // 1. Get cost elements (Kardex and Dedutores) using direct client match or state fallback
       let source: 'CLIENTE' | 'SKU_ESTADO' | 'NENHUM' = 'NENHUM';
       let sourceDetails = '';
@@ -500,8 +539,11 @@ export default function App() {
         }
       }
 
+      // Handle override even if matchingRows has no elements but override exists
+      const overrideKardex = orderKardexOverrides[index];
+
       // If no cost mappings are found
-      if (matchingRows.length === 0) {
+      if (matchingRows.length === 0 && overrideKardex === undefined) {
         return {
           sku: item.sku,
           qtd: item.qtd,
@@ -518,14 +560,23 @@ export default function App() {
 
       // Sort chronological descending
       const sortedMatches = sortRefsDescending(matchingRows);
-      const latestMatch = sortedMatches[0];
+      const latestMatch = sortedMatches[0] || { rotuloLinha: 'Manual', kardexUnit: overrideKardex || 0, dedutores: 0 };
       
       // Determine what elements to use based on user calculation choice (ultimo vs tresMeses)
       let referenceName = '';
       let kardexUnit = latestMatch.kardexUnit; // Always use latest monthly cost per rule
+      
+      // Apply inline override if specified by the user
+      if (overrideKardex !== undefined) {
+        kardexUnit = overrideKardex;
+      }
+
       let dedutoresRate = 0;
 
-      if (orderCalculationRef === 'ultimo') {
+      if (matchingRows.length === 0) {
+        referenceName = "Informado Manualmente";
+        dedutoresRate = 0;
+      } else if (orderCalculationRef === 'ultimo') {
         referenceName = `Último Mês (${latestMatch.rotuloLinha})`;
         dedutoresRate = latestMatch.dedutores;
       } else {
@@ -538,8 +589,8 @@ export default function App() {
       const totalVpcVpx = item.vpx + orderVpcGlobal;
       const evaluation = calculateEvaluation(
         referenceName,
-        source,
-        sourceDetails,
+        source === 'NENHUM' && overrideKardex !== undefined ? 'SKU_ESTADO' : source,
+        sourceDetails || 'Sobreposto manualmente',
         kardexUnit,
         dedutoresRate,
         totalVpcVpx,
@@ -547,8 +598,10 @@ export default function App() {
       );
 
       // Preços Alvo para 12% e 6% de margem
-      const targetPrice12 = (kardexUnit) / (1 - dedutoresRate - (totalVpcVpx / 100) - 0.12);
-      const targetPrice6 = (kardexUnit) / (1 - dedutoresRate - (totalVpcVpx / 100) - 0.06);
+      const divisor12 = 1 - dedutoresRate - (totalVpcVpx / 100) - 0.12;
+      const divisor6 = 1 - dedutoresRate - (totalVpcVpx / 100) - 0.06;
+      const targetPrice12 = divisor12 > 0 ? (kardexUnit) / divisor12 : 0;
+      const targetPrice6 = divisor6 > 0 ? (kardexUnit) / divisor6 : 0;
 
       return {
         sku: item.sku,
@@ -556,14 +609,14 @@ export default function App() {
         precoFinal: item.precoFinal,
         vpxItem: item.vpx,
         vlrTotal: item.vlrTotal,
-        source,
+        source: source === 'NENHUM' && overrideKardex !== undefined ? 'SKU_ESTADO' as const : source,
         sourceDetails,
         evaluation,
         targetPrice12: targetPrice12 > 0 ? targetPrice12 : null,
         targetPrice6: targetPrice6 > 0 ? targetPrice6 : null,
       };
     });
-  }, [orderItems, orderClient, orderEstado, orderVpcGlobal, orderCalculationRef, clienteRows, skuRows]);
+  }, [orderItems, orderClient, orderEstado, orderVpcGlobal, orderCalculationRef, orderKardexOverrides, clienteRows, skuRows]);
 
   const handleRecordBatchDecisions = () => {
     if (evaluatedOrderItems.length === 0) {
@@ -1006,6 +1059,45 @@ export default function App() {
                       ))}
                     </select>
                   </div>
+                </div>
+
+                {/* ROW 2.5: Custo Kardex Unitário (Ajuste Manual) */}
+                <div className="flex flex-col gap-1.5 bg-indigo-50/45 p-3.5 rounded-xl border border-indigo-100/60 shadow-sm">
+                  <div className="flex justify-between items-center text-xs font-bold text-indigo-900">
+                    <span className="flex items-center gap-1">
+                      <Coins className="h-3.5 w-3.5 text-indigo-650" />
+                      CUSTO KARDEX UNITÁRIO
+                    </span>
+                    {customKardex && (
+                      <button
+                        type="button"
+                        onClick={() => setCustomKardex('')}
+                        className="text-[10px] font-extrabold text-indigo-650 hover:text-indigo-850 bg-indigo-100/50 px-2 py-0.5 rounded cursor-pointer transition-all"
+                      >
+                        Resetar p/ Original
+                      </button>
+                    )}
+                  </div>
+                  <div className="relative mt-1">
+                    <div className="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none text-slate-500 font-bold text-xs">R$</div>
+                    <input
+                      type="text"
+                      value={customKardex}
+                      onChange={(e) => {
+                        let val = e.target.value;
+                        val = val.replace(/[^0-9.,]/g, '');
+                        setCustomKardex(val);
+                      }}
+                      className="w-full bg-white border border-indigo-200 focus:border-indigo-500 rounded-lg pl-8 pr-3 py-1.5 text-xs font-bold font-mono text-indigo-950 transition-all shadow-sm focus:ring-2 focus:ring-indigo-500/10 focus:outline-none"
+                      placeholder={currentDatabaseKardex > 0 ? currentDatabaseKardex.toFixed(2) : 'Custo Kardex...'}
+                    />
+                  </div>
+                  <span className="text-[9.5px] text-slate-400 mt-0.5 select-none leading-snug">
+                    {customKardex 
+                      ? `Custo simulado personalizado. Custo original cadastrado: R$ ${currentDatabaseKardex.toFixed(2)}`
+                      : `Custo original extraído da base de dados: R$ ${currentDatabaseKardex.toFixed(2)}`
+                    }
+                  </span>
                 </div>
 
                 {/* ROW 3: VPC (1/3) & Preço (2/3) */}
@@ -1593,6 +1685,7 @@ export default function App() {
                     onClick={() => {
                       setPastedOrderText('');
                       setOrderItems([]);
+                      setOrderKardexOverrides({});
                     }}
                     className="text-xs text-rose-600 hover:text-rose-800 font-bold transition-all cursor-pointer"
                   >
@@ -1936,16 +2029,94 @@ export default function App() {
                                   {/* Custo Base (Kardex) & Dedutores */}
                                   <td className="py-3 px-3 text-center">
                                     {hasEval ? (
-                                      <div className="flex flex-col items-center">
-                                        <span className="font-mono font-extrabold text-slate-800">
-                                          R$ {item.evaluation!.kardex.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
-                                        </span>
-                                        <span className="text-[9px] text-slate-400 mt-0.5">
-                                          Ded: {(item.evaluation!.dedutores * 100).toFixed(2)}%
-                                        </span>
+                                      <div className="flex flex-col items-center gap-1.5">
+                                        <div className="flex items-center justify-center bg-slate-50 border border-slate-200 hover:border-slate-300 rounded px-1.5 py-0.5 shadow-sm focus-within:ring-2 focus-within:ring-emerald-500/20 focus-within:border-emerald-500 transition-all">
+                                          <span className="text-slate-400 text-[10px] font-bold mr-0.5 select-none">R$</span>
+                                          <input
+                                            type="number"
+                                            step="0.01"
+                                            min="0"
+                                            value={
+                                              orderKardexOverrides[index] !== undefined
+                                                ? orderKardexOverrides[index]
+                                                : Number(item.evaluation!.kardex.toFixed(2))
+                                            }
+                                            onChange={(e) => {
+                                              const newCost = parseFloat(e.target.value);
+                                              if (!isNaN(newCost)) {
+                                                setOrderKardexOverrides(prev => ({
+                                                  ...prev,
+                                                  [index]: newCost
+                                                }));
+                                              } else {
+                                                setOrderKardexOverrides(prev => {
+                                                  const copy = { ...prev };
+                                                  delete copy[index];
+                                                  return copy;
+                                                });
+                                              }
+                                            }}
+                                            className="w-16 bg-transparent text-center focus:outline-none text-[11px] font-mono font-bold text-slate-800"
+                                            title="Clique para editar o Custo Kardex manualmente"
+                                          />
+                                        </div>
+                                        <div className="flex flex-col items-center gap-0.5 select-none text-[9px]">
+                                          <span className="text-slate-400 leading-none">
+                                            Ded: {(item.evaluation!.dedutores * 100).toFixed(2)}%
+                                          </span>
+                                          {orderKardexOverrides[index] !== undefined && (
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                setOrderKardexOverrides(prev => {
+                                                  const copy = { ...prev };
+                                                  delete copy[index];
+                                                  return copy;
+                                                });
+                                              }}
+                                              className="text-[9px] font-black text-indigo-650 hover:text-indigo-850 mt-0.5 block underline hover:no-underline transition-all"
+                                              title="Restaurar custo original da consulta"
+                                            >
+                                              Resetar
+                                            </button>
+                                          )}
+                                        </div>
                                       </div>
                                     ) : (
-                                      <span className="text-[10px] text-slate-400 font-semibold italic">Não mapeado</span>
+                                      <div className="flex flex-col items-center gap-1">
+                                        <div className="flex items-center justify-center bg-slate-50 border border-dashed border-slate-200 rounded px-1.5 py-0.5 shadow-sm focus-within:ring-2 focus-within:ring-indigo-500/20 focus-within:border-indigo-500 transition-all">
+                                          <span className="text-slate-400 text-[10px] font-bold mr-0.5 select-none font-sans">R$</span>
+                                          <input
+                                            type="number"
+                                            step="0.01"
+                                            min="0"
+                                            value={
+                                              orderKardexOverrides[index] !== undefined
+                                                ? orderKardexOverrides[index]
+                                                : ''
+                                            }
+                                            placeholder="S/ Custo"
+                                            onChange={(e) => {
+                                              const newCost = parseFloat(e.target.value);
+                                              if (!isNaN(newCost)) {
+                                                setOrderKardexOverrides(prev => ({
+                                                  ...prev,
+                                                  [index]: newCost
+                                                }));
+                                              } else {
+                                                setOrderKardexOverrides(prev => {
+                                                  const copy = { ...prev };
+                                                  delete copy[index];
+                                                  return copy;
+                                                });
+                                              }
+                                            }}
+                                            className="w-16 bg-transparent text-center focus:outline-none text-[11px] font-mono font-semibold text-slate-500 placeholder-slate-400"
+                                            title="Inserir Custo Kardex manualmente"
+                                          />
+                                        </div>
+                                        <span className="text-[9px] text-slate-400 font-normal italic">Informar custo</span>
+                                      </div>
                                     )}
                                   </td>
 

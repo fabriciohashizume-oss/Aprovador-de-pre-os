@@ -176,7 +176,8 @@ export function evaluateMargin(
   selectedSku: string,
   selectedEstado: string,
   precoNF: number,
-  vpcVpxPercent: number
+  vpcVpxPercent: number,
+  overrideKardex?: number
 ): SimulationResult {
   
   let source: 'CLIENTE' | 'SKU_ESTADO' | 'NENHUM' = 'NENHUM';
@@ -228,6 +229,26 @@ export function evaluateMargin(
   }
   
   if (matchingRows.length === 0) {
+    if (overrideKardex !== undefined) {
+      const defaultRefName = "Custo Informado Manualmente";
+      const result = calculateEvaluation(
+        defaultRefName,
+        'NENHUM',
+        'Custo Informado Manualmente',
+        overrideKardex,
+        0,
+        vpcVpxPercent,
+        precoNF
+      );
+      const targetPrice12 = calculateTargetPrice(overrideKardex, 0, vpcVpxPercent, 0.12);
+      const targetPrice6 = calculateTargetPrice(overrideKardex, 0, vpcVpxPercent, 0.06);
+      return {
+        ultimoMes: result,
+        tresMeses: result,
+        targetPrice12,
+        targetPrice6
+      };
+    }
     return {
       ultimoMes: null,
       tresMeses: null,
@@ -242,11 +263,12 @@ export function evaluateMargin(
   // 1. Último Mês
   const latestMatch = sortedMatches[0];
   const latestRefName = `Último Mês (${latestMatch.rotuloLinha})`;
+  const cardKardex = overrideKardex !== undefined ? overrideKardex : latestMatch.kardexUnit;
   const ultimoMesResult = calculateEvaluation(
     latestRefName,
     source,
     sourceDetails,
-    latestMatch.kardexUnit,
+    cardKardex,
     latestMatch.dedutores,
     vpcVpxPercent,
     precoNF
@@ -254,8 +276,8 @@ export function evaluateMargin(
   
   // 2. Últimos 3 Meses
   const last3Matches = sortedMatches.slice(0, 3);
-  // Mesmo para o cálculo médio dos últimos 3 meses, considerar o kardex do ultimo mês disponível
-  const ultimoKardex = latestMatch.kardexUnit;
+  // Mesmo para o cálculo médio dos últimos 3 meses, considerar o kardex do ultimo mês disponível ou o override
+  const ultimoKardex = overrideKardex !== undefined ? overrideKardex : latestMatch.kardexUnit;
   const avgDedutores = last3Matches.reduce((sum, item) => sum + item.dedutores, 0) / last3Matches.length;
   const listMonths = last3Matches.map(item => item.rotuloLinha).join(', ');
   const m3RefName = `Média 3 Meses (${listMonths})`;
@@ -270,7 +292,7 @@ export function evaluateMargin(
     precoNF
   );
   
-  // 3. Preço Alvo para Margem Target (12%) e Regular (6%) usando o kardex do último mês disponível
+  // 3. Preço Alvo para Margem Target (12%) e Regular (6%) usando o kardex ativo
   const referenceKardex = ultimoKardex;
   const referenceDedutores = avgDedutores;
   
